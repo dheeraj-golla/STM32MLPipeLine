@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "stm32-ml-pipeline"
+version = "0.1.0"
+description = "ML model training and conversion pipeline for STM32 Cortex-M deployment"
+authors = ["Dheeraj Golla <you@example.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+# Pin to 3.12 specifically. TF 2.21 supports 3.10-3.13; 3.14 is not yet
+# supported by TF. We pick 3.12 because it's the most-tested combination
+# and matches the wheel I used to generate the reference weights.
+python = "~3.12"
+tensorflow = "~2.21"
+numpy = "^2.0"
+
+[tool.poetry.group.dev.dependencies]
+ipython = "^8.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

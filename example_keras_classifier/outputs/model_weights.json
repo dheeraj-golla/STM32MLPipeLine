@@ -1,0 +1,42 @@
+{
+  "architecture": "Dense(1, activation=sigmoid)",
+  "input_shape": [
+    6
+  ],
+  "input_dtype": "float32",
+  "weights": [
+    0.20395341515541077,
+    0.20439445972442627,
+    0.18716295063495636,
+    0.19427767395973206,
+    0.23444566130638123,
+    0.21492275595664978
+  ],
+  "bias": [
+    -6.6528425216674805
+  ],
+  "activation": "sigmoid",
+  "formula": "y_prob = sigmoid(sum(x[i] * W[i] for i in 0..5) + b[0])",
+  "classification_threshold": 0.5,
+  "training": {
+    "seed": 42,
+    "n_train": 4000,
+    "n_val": 1000,
+    "epochs": 30,
+    "batch_size": 64,
+    "optimizer": "adam(lr=0.01)",
+    "loss": "binary_crossentropy"
+  },
+  "data": {
+    "input_range": [
+      1.0,
+      10.0
+    ],
+    "label_rule": "1 if sum(x) > 33.0 else 0",
+    "label_noise_rate": 0.1
+  },
+  "metrics": {
+    "noisy_val_accuracy": 0.8759999871253967,
+    "noise_free_test_accuracy": 0.9589999914169312
+  }
+}
