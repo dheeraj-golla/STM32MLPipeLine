@@ -1,0 +1,21 @@
+{
+  "toolchain": "STM32CubeIDE",
+  "variant": "ApplicationTemplate",
+  "fromMx": false,
+  "isGenerated": true,
+  "name": "test_05_14_2026",
+  "createdAt": 1778785324809,
+  "lastModified": 1779347395195,
+  "lastAccessed": 1779347395194,
+  "path": "C:\\Users\\DheerajGolla\\.stm32cubeaistudio\\workspace",
+  "board": "B-L4S5I-IOT01A",
+  "mcu": "",
+  "type": "BYOM",
+  "uartInstance": {
+    "rxpin": "PB7",
+    "txpin": "PB6",
+    "usart": "USART1",
+    "baudrate": 115200
+  },
+  "lastGenerationRunId": "run-2"
+}
