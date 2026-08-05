@@ -1,492 +1,57 @@
-# Keras Classifier Conversion via ST Edge AI Studio
+# Keras Classifier Conversion via ST Edge AI Studio — First Pass
 
-Living document for the experiment of converting a Python-trained Keras
-classifier to C for the B-L4S5I-IOT01A (STM32L4S5VI) using ST Edge AI Studio v4.0.
+> **Created:** 2026-05-20 (approximate — first experiment session)
+> **Last edited:** 2026-08-05
+> **Status:** Living document — detailed reference for the first experiment
 
-**Scope of this pass**: float32 only, end-to-end pipeline.
-**Out of scope for this pass**: int8 quantization, replay-system integration,
-power profiling, multi-layer model verification.
-
----
-
-## 1. Status
-
-| | |
-|---|---|
-| Pipeline end-to-end | ✅ working (Keras → TFLite → AI Studio → CubeIDE → board) |
-| Host conversion accuracy | ✅ validated (1.4e-9 max abs error, 10 random samples) |
-| On-target execution | ✅ inference runs, deterministic timing |
-| On-target conversion accuracy | ✅ validated by AI Studio (10 random samples; MAE ≈ 0, SNR 130 dB) |
-| **Next: test with real data** | ❌ on-target accuracy vs 254-vector reference set not yet measured |
-| **Then: quantize** (int8) | ❌ deferred |
-| **Then: test with actual gridware model** | ❌ deferred (realistic multi-layer model) |
+Living document. Notes from the first attempt at running the
+example Keras classifier through ST Edge AI Studio for deployment on
+B-L4S5I-IOT01A (STM32L4S5VI). Pass 1 is float32; pass 2 will be int8.
 
 ---
 
-## 2. The eight framework requirements
+## Session decisions (chronological)
 
-The broader framework being designed must address eight requirements. This
-experiment exercises some of them and is informative about others.
+- Float32 first; int8 quantization is pass 2.
+- Tool: ST Edge AI Studio v4.0 (replaces X-CUBE-AI).
+- Target: B-L4S5I-IOT01A (STM32L4S5VI).
+- Optimization preference: "Balanced". Compression off.
+- Memory pool: default / single pool (activations are 4 bytes for this model, doesn't matter functionally).
+- Validate input data: random/synthetic for this pass. `test_vectors.json` schema not directly consumable by AI Studio.
+- Validate location: host first, target later.
+- **Handoff format: TFLite, not Keras.** See Req #2 and Bug #1.
+- **Quantization workflow (pass 2): Pattern B** (Keras → quantized TFLite in Python → AI Studio). See Req #1.
 
-| # | Requirement | Exercised in pass 1? |
+---
+
+## Notes organized by requirement
+
+### Req #1 — Reduce model size (Quantization)
+
+#### Three options for getting a quantized model into AI Studio
+
+| Approach | Workflow | Trade-offs |
 |---|---|---|
-| 1 | Quantization (reduce model size via lower precision) | Partially — quantization paths characterized but not run |
-| 2 | Maintainability (handoff stable across tool/library versions) | Yes — Bug #1 forced an early decision point |
-| 3 | Verifiability (outputs incl. intermediates checkable vs Python) | Partially — host + AI-Studio target validation done; intermediate-tensor inspection not exercised |
-| 4 | Replay-system compatibility | No |
-| 5 | Power consumption | No |
-| 6 | Compute resources (FPU, CMSIS-NN, etc.) | Partially — float32 cycle counts measured |
-| 7 | Ease of use for Applied Scientists (no C/C++) | Partially — AI Studio UI walked through; gotchas documented |
-| 8 | Configurability via config file (no FW rev needed) | No, but constraint clarified (means app hyperparameters, not swappable weights) |
+| **Pattern A** | Keras (`.keras`/`.h5`) → AI Studio does PTQ → C | Single tool. Tool has a Quantize button when input is Keras. But `.keras` is fragile (Bug #1). Quantization scheme lives in ST's tool; verification is harder (no Python ground truth for int8). |
+| **Pattern B** | Keras → quantized `.tflite` in Python → AI Studio → C | **Chosen.** More steps. Stable handoff. Reproducible quantization in Python. Can run quantized `.tflite` in TFLite Python interpreter to produce ground-truth int8 outputs for verification. |
+| **Hybrid** | Keras → `.h5` (legacy, no `quantization_config` field) → AI Studio does PTQ → C | Sidesteps Bug #1. Still cedes quantization control to ST. Worth knowing as a fallback. |
 
----
+#### What AI Studio's UI offers (observed)
 
-## 3. The model
+- **Input = Keras**: Quantize button present, calibration dataset prompt available.
+- **Input = TFLite (float)**: No Quantize button. Tool treats the TFLite as source of truth — if float in, float out; if int8 in, int8 out. To get int8 you must quantize in TFLite first.
+- **Input = TFLite (int8)**: Tool generates int8 C using `STAI_FORMAT_S8` data path.
 
-A toy logistic-regression classifier — single Dense layer, 6 float32 inputs,
-sigmoid activation. 7 parameters total (6 weights + 1 bias). Deliberately
-simple so the conversion tool's behavior is easy to inspect.
+So "do both quantization and conversion in AI Studio" requires staying on the Keras input path = Pattern A or Hybrid. Pattern B requires quantizing in Python before the tool sees the model.
 
-```python
-model = keras.Sequential([
-    keras.Input(shape=(6,), name="features"),
-    keras.layers.Dense(1, activation="sigmoid", name="classifier"),
-])
-```
+#### Why Pattern B for this framework
 
----
+- **Verification**: TFLite Python interpreter runs the quantized model in Python → ground-truth int8 outputs. Verification reduces to "does TFLite-in-Python agree with C-on-target?" — tractable.
+- **Reproducibility**: Quantization choices are explicit in Python code, version-controlled, diffable. AI Studio's internal PTQ choices are opaque.
+- **CI-ability**: Quantization is reproducible across machines; ST's PTQ may depend on tool version.
+- Cost: extra step in the pipeline; AS needs to understand TFLite quantization API.
 
-## 4. Tool stack and configuration
-
-| | |
-|---|---|
-| Training | Python 3.x with Keras 3.3+ (whatever the training env has) |
-| Conversion | ST Edge AI Studio v4.0 (replaces X-CUBE-AI — older tutorials use the old name) |
-| Build | STM32CubeIDE |
-| Flash | STM32CubeProgrammer (via Debug-as-application in CubeIDE) |
-| Target board | B-L4S5I-IOT01A |
-| Target MCU | STM32L4S5VI (Cortex-M4F, FPU, no FMA) |
-| HCLK | 120 MHz (MSI 4 MHz × PLL N=60 / M=1 / R=2) |
-
-**AI Studio build options recorded** (for reproducibility):
-- `optimization: balanced`
-- `target/series: stm32l4`
-- `c_api: st-ai`
-- `options: allocate-inputs, allocate-outputs, multi-heaps, use-lite-runtime, use-st-ai`
-- `memory_pool: default` (activations are 28 B — placement doesn't matter for this model)
-- Runtime version: `v12.0.0-2ca1f59f` compiled with GCC 13.3.1
-
-These all belong in the artifact contract (Req #2). Memory pool, optimization
-preference, and runtime version can all change generated code structure.
-
----
-
-## 5. Workflow
-
-1. Train in Python → save model.
-2. Re-save as `.tflite` (workaround for Bug #1).
-3. Load into ST Edge AI Studio → Analyze → Generate Project (full CubeIDE project).
-4. Open `CubeIDE/` subfolder in STM32CubeIDE (Bug #2).
-5. Build → flash via Debug → open serial terminal at 115200 8N1 on ST-Link VCP.
-6. Observe `LC_PRINT` output every 5 seconds.
-
----
-
-## 6. Handoff format: three options
-
-AI Studio accepts several input formats. Each has trade-offs that matter
-for the framework. **The framework-level choice is still open** and will be
-revisited after pass 2.
-
-| Format | Pros | Cons | Quantization path |
-|---|---|---|---|
-| **`.keras`** (Keras native) | Single tool from training to C; AI Studio offers in-tool Quantize button (Pattern A) | Serializes Python objects keyed to specific Keras class layouts. Loading fails when AI Studio's bundled Keras doesn't match the training-env version (Bug #1). Quantization scheme lives in ST's tool — harder to reproduce in Python | AI Studio does PTQ; you provide calibration dataset |
-| **`.h5`** (Keras legacy) | More stable than `.keras` across versions; AI Studio still offers in-tool quantize | Older format, no longer Keras default; same loss-of-quantization-control as `.keras` | Same as `.keras` |
-| **`.tflite`** | Versioned FlatBuffer schema, much more stable across versions. Failure mode under skew is "unsupported op" (debuggable) instead of "can't deserialize" (a wall). Used in this pass | Quantization must be done in Python *before* handoff (AI Studio does NOT offer in-tool quantize for TFLite input). More steps in pipeline | TFLiteConverter in Python (Pattern B); quantized `.tflite` runs in Python interpreter as ground-truth reference |
-
-### Three quantization patterns (Req #1)
-
-| Pattern | Flow | Trade-offs |
-|---|---|---|
-| **A** | Keras → AI Studio does PTQ → C | Simplest. Tool controls scheme. Verification harder (no Python ground truth). |
-| **B** | Keras → quantized `.tflite` (Python) → AI Studio → C | Reproducible quantization. Python ground truth for verification. More work. |
-| **Hybrid** | `.h5` → AI Studio does PTQ → C | Sidesteps Bug #1. Still cedes quantization control to ST. |
-
-**Open question for pass 2**: which to use? Pattern B is most rigorous but
-adds friction for Applied Scientists (Req #7). Pattern A is simpler but
-ties verification to ST's internal quantization choices. Decide based on
-pass-2 experimentation, not a priori.
-
----
-
-## 7. Conversion output
-
-### Files generated
-
-| File | Compile into FW? | Source/Binary | Per-model or shared | Role |
-|---|---|---|---|---|
-| `network.c` / `.h` | Yes | Source | Per-model | Inference graph + public API |
-| `network_data.c` / `.h` | Yes | Source | Per-model | Weight blob as packed `uint64_t` |
-| `network_weights.c` / `.h` | Yes | Source | Per-model | Weight-copy helper (empty stub for internal Flash) |
-| `network_details.c` / `.h` (if present) | Yes | Source | Per-model | Layer metadata, optional debug info |
-| `stai.h`, `stai_debug.h`, `ai_*.h` | Yes (include) | Source headers | Shared | Runtime API |
-| `NetworkRuntime1200_CM4_GCC.a` | Yes (link) | **Binary** | Shared | Precompiled runtime |
-| Generation report, validation CSVs | No (bookkeeping) | — | Per-run | Version-control alongside model |
-
-### The `.a` is ABI- and target-locked
-
-- `GCC` in the name = GCC ABI. Won't link with Keil/ARMCC or IAR. AI Studio
-  typically generates per-toolchain variants.
-- Generated for Cortex-M4F hard-float ABI. Won't work on M0+/M7 without
-  regenerating.
-- Runtime version (`v12.0.0-2ca1f59f`) is part of the artifact contract — pin
-  it alongside the model and AI Studio version.
-
-### Weight storage (decoded)
-
-```c
-STAI_ALIGNED(8)
-const uint64_t g_network_weights_array[4] = {
-  0x3e514cc83e50d92aU, 0x3e46f0ba3e3fa7a5U, 0x3e5c14b63e701286U, 0xc0d4e416U,
-};
-```
-
-- 7 float32 weights = 28 B. Padded to 32 B (`uint64_t[4]`) for 8-byte alignment.
-- `STAI_ALIGNED(8)` lets FPU `VLDM` load 2 floats/cycle.
-- Opaque `uint64_t` (not `float[7]`) so the same generator handles fp32/fp16/int8 without changing declared type.
-- Little-endian: first u64 contains float32 `0x3e50d92a` ≈ 0.2040 (low addr) and `0x3e514cc8` ≈ 0.2043.
-- Last entry `0xc0d4e416` ≈ −6.65 is the bias.
-- `const` → `.rodata` → Flash.
-
-### Memory footprint
-
-ML-only (from AI Studio's report):
-
-| | Size |
-|---|---|
-| Flash (text + rodata + lib) | 2,322 B |
-| RAM (activations, bss) | 28 B |
-| MACC | 17 |
-
-Full firmware image (built CubeIDE project, includes HAL + board peripherals):
-
-| Section | Bytes |
-|---|---|
-| `text` (Flash) | 27,472 |
-| `data` (Flash → RAM at boot) | 96 |
-| `bss` (RAM only) | 10,852 |
-| **Total Flash** | **27,568** |
-| **Total RAM** | **10,948** |
-
-The ~25 KB Flash overhead is HAL drivers, peripheral init, `printf` machinery,
-and C runtime — none of it ML-related. The ~10.9 KB RAM is mostly main stack,
-heap, HAL handles, UART buffers.
-
-**Framework takeaway**: adding ML to STM32L4S5VI firmware costs ~2.3 KB Flash
-+ 28 B RAM for this model. Small models are dominated by runtime overhead;
-big models will invert.
-
----
-
-## 8. Integration into firmware
-
-AI Studio's generated `main.c` wraps the runtime into two entry points:
-
-```c
-int main(void) {
-  HAL_Init();
-  SystemClock_Config();
-  MX_GPIO_Init();
-  STM32CubeAI_Studio_AI_Init();      // initializes UART + ST AI runtime
-  while (1) {
-    STM32CubeAI_Studio_AI_Process(); // runs inference in a 5 s loop
-  }
-}
-```
-
-The most relevant underlying API calls:
-
-| Function | What it does |
-|---|---|
-| `stai_runtime_init()` | Initialize the runtime library globally. |
-| `stai_network_init()` | Initialize a model's runtime context (called once per model). |
-| `stai_network_set_activations()` | Tell runtime where the scratch buffer lives. |
-| `stai_network_get_inputs()` / `set_inputs()` | Buffer pointers for input tensors. |
-| `stai_network_get_outputs()` / `set_outputs()` | Buffer pointers for output tensors. |
-| `stai_network_run()` | Execute one inference (sync or async). |
-| `stai_network_set_callback()` | Register callback to inspect intermediate activations during inference. The planned hook for Reqs #3 and #4. |
-| `stai_network_get_error()` | Read the runtime's error state. |
-
-### Default harness runs on ZERO inputs
-
-`acquire_and_process_data()` and `post_process()` in `app_x-cube-ai.c` are
-empty stubs. The activation buffer is zero-initialized (`bss`), so the model
-runs inference on `[0, 0, 0, 0, 0, 0]` every loop iteration — output is
-constant `sigmoid(bias) ≈ 0.0013`. To exercise real inputs, fill these stubs.
-
-### Useful capabilities already wired
-
-| Feature | Notes |
-|---|---|
-| UART (`LC_PRINT`) | USART1 → ST-Link VCP, 115200 8N1. Working out of the box. |
-| DWT cycle counter | Microsecond-precision inference timing in `aiRun()`. |
-| Linker section `.AI_RAM` | Activation buffer placed in its own section — hook for placing activations in specific SRAM region (Reqs #5, #6). |
-| `STAI_MODE_SYNC` | Default mode. `STAI_MODE_ASYNC` exists; not yet investigated. |
-
----
-
-## 9. Validation
-
-### Host (PC): TFLite reference vs generated C
-
-AI Studio's `validate --mode host` runs both on x86 with 10 random inputs.
-
-| Metric | Value |
-|---|---|
-| Max absolute error | 1.4 × 10⁻⁹ |
-| Mean absolute error | 5.4 × 10⁻¹⁰ |
-| Samples bit-exact | 2 of 10 |
-
-About 6 ULPs at the output magnitude. Consistent with float32 rounding only.
-No structural divergence.
-
-> **ULP (Unit in the Last Place)**: the gap between two consecutive
-> representable float values at a given magnitude. Float32 has a 23-bit
-> mantissa → relative epsilon ≈ 1.19e-7. At output magnitude ~2e-3, one ULP
-> ≈ 2.4e-10 absolute. Max measured error 1.4e-9 ÷ 2.4e-10 ≈ 5.8 ULPs.
-> Saying "6 ULPs" instead of "1.4e-9" is more useful: it conveys that the
-> error is just float-rounding noise (no structural divergence), regardless
-> of the output's absolute scale. Bit-exact = 0 ULP.
-
-### Target (board): same setup, but generated C runs on the MCU
-
-AI Studio's `validate --mode target` flashes a validation firmware that
-exchanges inputs/outputs with the PC over UART (protobuf protocol), runs the
-model on-device, and compares against the host reference.
-
-| Metric | Value |
-|---|---|
-| MAE | ≈ 0 |
-| RMSE | 1 × 10⁻⁹ |
-| L2 relative error | 3 × 10⁻⁷ |
-| SNR | 130 dB |
-| Cosine similarity | 1.000000 |
-
-**On-target error is essentially equivalent to host error.** The FMA/`expf`
-differences between x86 and Cortex-M4F that could in principle cause drift
-did NOT materialize at a meaningful level for this model. Likely because the
-model is small (no error accumulation in a 6-MAC dot product) and the sigmoid
-is operating in a saturated region (small input deltas don't move the output).
-
-### Important caveat
-
-Both validations use **10 random inputs picked by AI Studio**, not our
-254-vector reference set (`test_vectors.json`). Random-input validation is a
-smoke test on the conversion pipeline. It is **not** sign-off-grade validation
-of the model. For sign-off (Req #3) we need:
-
-- Inputs from the reference test set
-- Output comparison against the Python reference's saved probabilities
-- Sign-off criterion = class agreement, not numerical tolerance
-
-This is the immediate next step.
-
-### Why "max error < X" is not a sign-off criterion
-
-- Max error depends on the input set. If validation never saw the failure
-  case, max error tells you nothing about it.
-- For a classifier, what matters is whether errors cross the decision
-  threshold (e.g. 0.5 for binary sigmoid). A 0.1 error at output 0.9 is
-  fine; the same error at output 0.49 is a wrong prediction.
-- Right framing: "0 disagreements on N reference vectors" or "≤ K
-  disagreements where K is justified," with max/mean error as diagnostic.
-
----
-
-## 10. On-target performance
-
-### Whole-network timing
-
-Two numbers, both correct but measuring different things:
-
-| Source | Cycles | µs @ 120 MHz | What it measures |
-|---|---|---|---|
-| AI Studio Validate-on-target | **1,026** | 8.6 | Pure `stai_network_run()` call |
-| Flashed Cube project (our build, UART-printed) | 1,234 | 10.3 | Same call + harness overhead (UART, DWT setup, error checks) |
-
-Use 1,026 as the "inference compute" baseline. Use 1,234 as "what it
-costs in a realistic app loop." Both are deterministic across 70+ runs
-(zero variance).
-
-### Per-layer breakdown (from Validate-on-target)
-
-| Layer | Cycles | % of total |
-|---|---|---|
-| Dense (matmul + bias) | 446 | 43% |
-| Sigmoid (nonlinearity) | 580 | 57% |
-| **Total** | **1,026** | |
-
-**Key finding: sigmoid dominates inference cost.** A single sigmoid takes
-longer than the entire 6-input Dense layer. Cause: `expf()` from libm,
-software-emulated on Cortex-M4F (no hardware transcendentals).
-
-Per-MAC cost in the Dense layer = 446 / 7 ≈ 64 cycles/MAC. Way above the
-theoretical ~1 cycle/MAC for VFMA-pipelined. The overhead is in kernel
-dispatch and bounds-checking, not arithmetic — fixed-cost-dominated regime
-for a model this tiny. Real models with 1000+ MACs will amortize this.
-
-### Implications for pass 2 (int8)
-
-- TFLite's int8 sigmoid is LUT-based, not `expf`-based. Expected: ~50–100
-  cycles instead of 580. Net inference cycle reduction proportional to that.
-- Int8 Dense layer can use SIMD instructions (`SMLAD`, etc.) on M4F's DSP
-  extension. Expected: meaningfully lower than 446 cycles for the same MACs.
-- Combined effect: a fair-but-rough expectation is 3–5× speedup for this
-  model, more for bigger models.
-
-### Runtime capabilities (from Validate-on-target metadata)
-
-- Callback granularity: `IO_ONLY`, `PER_LAYER`, `PER_LAYER_WITH_DATA`.
-  `PER_LAYER_WITH_DATA` is the option that gives us the intermediate tensors
-  needed for Req #3.
-- Device attrs: `fpu, art_lat=5, art_icache, art_dcache`. ART cache is on
-  for both instructions and data. **Reported cycle counts are warm-cache.**
-  Cold-cache numbers would be higher; relevant if the framework ever has to
-  wake from a stop mode and run one inference before the cache warms.
-
----
-
-## 11. Bugs and gotchas
-
-### Bug #1: Keras format version skew
-
-- **Symptom**: AI Studio v4.0 fails to load `model.keras`:
-  ```
-  E010(InvalidModelError): Unrecognized keyword arguments passed to Dense:
-  {'quantization_config': None}
-  ```
-- **Root cause**: Training env (Keras 3.3+) writes a `quantization_config`
-  field on Dense layers; AI Studio bundles older Keras that can't deserialize it.
-- **Workaround**: re-save model as `.tflite` (or `.h5`) before AI Studio. See
-  `resave_model.py`.
-- **Framework implication**: drives Section 6 — the choice of handoff format
-  has real maintainability consequences. `.keras` is fragile across Keras
-  versions; `.tflite` and `.h5` are more stable.
-
-### Bug #2: "Build All" greyed out in CubeIDE
-
-- **Symptom**: After importing AI Studio's "Generate Project" output into
-  CubeIDE, the Build All action is disabled and the project doesn't show as
-  a C project.
-- **Root cause**: AI Studio puts the buildable project in a `CubeIDE/`
-  subfolder of its output. The top-level output folder is not a project.
-- **Fix**: Import the `CubeIDE/` subfolder, not the top-level.
-- **Framework implication**: document this in onboarding docs (Req #7) —
-  cheap way to save AS users an hour of confusion.
-
-### Gotchas (not bugs, worth knowing)
-
-- `MX_USART1_UART_Init()` is called from the AI runtime init path, not from
-  `main()` directly. So UART works "for free" if you use the generated
-  scaffolding, but a custom `main()` needs to call it explicitly.
-- `allocate-inputs` / `allocate-outputs` build options place I/O inside the
-  activation buffer. Application MUST consume outputs before the next
-  inference, or they get clobbered.
-- `STAI_ALIGNED(32)` on the activation buffer — bigger than M4F strictly
-  needs. Defensive for future caches or wider loads on other parts.
-- `aiInit()` silently overwrites `ret_code` without checking — the framework
-  should tighten this; don't rely on ST's template error handling.
-
----
-
-## 12. Open questions for later passes
-
-1. Will Pattern A (AI Studio quantization) and Pattern B (Python quantization)
-   produce numerically different int8 outputs? If so, which to trust?
-2. What's the representative dataset for the calibration step?
-3. Does AI Studio honor all TFLite quantization choices (per-tensor vs
-   per-axis, symmetric vs asymmetric)?
-4. What does the full runtime variant offer over `use-lite-runtime` (which
-   we used)?
-5. How does `STAI_MODE_ASYNC` work? Can inference overlap with other work?
-6. Memory-pool partitioning behavior for multi-region models — not relevant
-   here, but will be for real models with activations > 64 KB.
-7. Cold-cache vs warm-cache cycle counts — relevant for power-aware
-   wake-from-stop scenarios.
-8. Callback overhead with `PER_LAYER_WITH_DATA` — what's the perf cost when
-   inspecting every intermediate tensor?
-
----
-
-## 13. To-do
-
-### Done
-
-- [x] Install AI Studio v4.0
-- [x] Re-save model as `.tflite` (workaround for Bug #1)
-- [x] Generate C code + CubeIDE project
-- [x] Inspect generated source (weight storage, API, harness)
-- [x] Read generation report (Flash 2,322 B / RAM 28 B / MACC 17)
-- [x] Host Validate (1.4e-9 max abs error)
-- [x] Target Validate via AI Studio (MAE ≈ 0, 1,026 cycles, per-layer breakdown)
-- [x] Build CubeIDE project (text=27,472 / data=96 / bss=10,852)
-- [x] Flash to B-L4S5I-IOT01A
-- [x] Observe UART output (`LC_PRINT` cycle counts every 5 s)
-
-### Next: test with real data (current toy model, float32)
-
-- [ ] Replace `acquire_and_process_data()` stub with real test vectors from `test_vectors.json` (start with one hardcoded; later UART loop for all 254)
-- [ ] Add output print in `post_process()` (may need `-u _printf_float` linker flag)
-- [ ] Compute class-agreement rate (sign-off criterion for Req #3)
-- [ ] Update tolerance field in `test_vectors.json` with measured value
-
-### Then: quantize (int8)
-
-- [ ] Define calibration dataset
-- [ ] Quantize in Python via `tf.lite.TFLiteConverter` (Pattern B sketch in Appendix B)
-- [ ] Validate quantized `.tflite` in TFLite Python interpreter
-- [ ] Feed quantized `.tflite` to AI Studio; verify int8 C generation
-- [ ] On-target validation of int8 outputs
-- [ ] Compare cycle counts vs float32 baseline (1,026 cycles)
-- [ ] Decide: Pattern A or Pattern B for the framework?
-
-### Then: test with actual gridware model (realistic multi-layer)
-
-- [ ] Run the full pipeline on a realistic gridware model
-- [ ] Exercise `stai_network_set_callback` with `PER_LAYER_WITH_DATA` (relevant for Reqs #3, #4)
-- [ ] Re-evaluate footprint, cycle counts, accuracy on a real workload
-- [ ] Revisit handoff-format decision in light of real-model behavior
-
-### Other framework architecture work
-
-- [ ] Investigate `STAI_MODE_ASYNC`
-- [ ] Replay-system integration (Req #4)
-- [ ] Config-file loader design (Req #8)
-- [ ] Power profiling (Req #5)
-- [ ] Linker script: map `.AI_RAM` to specific SRAM region for Reqs #5, #6
-- [ ] Compare `use-lite-runtime` vs full runtime
-- [ ] Vary AI Studio optimization preference ("Time" vs "RAM" vs "Balanced")
-
----
-
-## Appendix A: TFLite resave script
-
-```python
-# resave_model.py
-import os
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-import tensorflow as tf
-from tensorflow import keras
-
-model = keras.models.load_model("outputs/model.keras")
-
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
-tflite_model = converter.convert()
-with open("outputs/model.tflite", "wb") as f:
-    f.write(tflite_model)
-```
-
-## Appendix B: Pass-2 quantization sketch (not yet run)
+#### Pass-2 conversion sketch (for reference, not yet run)
 
 ```python
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
@@ -498,3 +63,499 @@ converter.inference_output_type = tf.int8
 tflite_int8 = converter.convert()
 ```
 
+#### Open questions for pass 2
+
+- What's the representative dataset for this model? Needs to cover the input distribution at deployment time.
+- Does AI Studio honor all TFLite quantization choices (per-tensor vs per-axis, symmetric vs asymmetric)? Per-axis Conv weights are typical in TFLite; some kernels in ST runtime may only support per-tensor.
+- What's the runtime's int8 op coverage? `stai.h` declares `STAI_FORMAT_S8` and the runtime supports it — but does it have every TFLite int8 op, or a subset?
+
+#### Runtime format support (from `stai.h`)
+
+The runtime supports: `FLOAT32`, `FLOAT64`, signed/unsigned ints `S/U 1/4/8/16/32/64`, and Q-format `Q7/Q15`. Standard int8 quantization targets `STAI_FORMAT_S8`. Confirms the runtime can handle pass-2 output; doesn't confirm every TFLite op is implemented.
+
+
+### Req #2 — Maintainability
+
+- **`.keras` is NOT a stable handoff format.** Serializes Python objects keyed to specific Keras class layouts. New Keras versions add fields older Keras can't deserialize. Confirmed by Bug #1 below.
+- **`.tflite` IS a stable handoff format.** FlatBuffer with explicit, versioned schema (`schema.fbs`). Forward/backward compatibility is a design goal. Failure mode is "unsupported op" (debuggable), not "can't deserialize" (a wall).
+- **`.onnx` is similar to `.tflite`** in stability. Versioned opsets, defined semantics. Backup option if TFLite hits walls in pass 2.
+- **Decision**: framework handoff format = `.tflite`.
+- Memory pool configuration is part of the artifact contract — must be version-controlled with the model, not a UI choice that drifts between runs.
+- AI Studio version must be pinned and documented for reproducible builds.
+
+### Req #3 — Verifiability (intermediate calculations)
+
+**Bit-exactness is well-defined but rarely achievable across heterogeneous HW.**
+
+IEEE-754 float32 is per-op deterministic. Non-determinism between Python (x86) and Cortex-M4F comes from:
+
+- Op ordering in dot products (associativity not guaranteed)
+- FMA presence (x86 yes, Cortex-M4F's VFPv4-SP no) — single biggest factor
+- `expf()` implementation differences (libm varies across platforms)
+
+User confirmed small differences between Claude-server Python and Mac Python — consistent with FMA + libm.
+
+**Tolerance is application-defined, not converter-defined.**
+
+- "Max error < X" is a smoke test, not a sign-off criterion.
+- Classifier sign-off = agreement on predicted class across reference set.
+- Regression = absolute or relative error tied to physical units.
+- Anomaly detection = FPR/FNR shift on a labeled reference set.
+
+**For THIS model** (Dense(1, sigmoid) on 6 features), starting absolute tolerance `1e-5`:
+
+- Dot product of 6 mul-adds → ~1e-6 from accumulated rounding.
+- Sigmoid approximation → up to ~1e-5 from libm differences.
+- 1e-5 is a round number above both. Tighter than this is suspicious (likely not running what you think).
+
+Smoke-test thresholds for AI Studio's reported max error:
+
+- `< 1e-5`: clean, move on
+- `1e-4` to `1e-3`: worth investigating, not blocking
+- `> 1e-2`: stop, investigate
+
+**AI Studio's built-in Validate step is one input to verifiability, not the whole story.** It compares Keras (Python) vs generated C (x86). It does NOT compare C-on-target vs Python-reference, which is the comparison the framework needs.
+
+Update `test_vectors.json` tolerance field AFTER measuring actual error, not before.
+
+### Req #4 — Compatible with Replay System
+
+Not addressed this session.
+
+Open: what does the Replay System consume? Inputs only? Inputs + intermediate state? This shapes whether the generated C API needs to expose intermediate-tensor hooks.
+
+### Req #5 — Reduce power consumption
+
+Not addressed directly this session.
+
+Note for later: memory pool placement matters here. SRAM2 on L4S5VI can be retained in stop modes; SRAM1/3 may not be. If sleeping between inferences, weight/activation placement affects wake cost. Memory pool config has implications across Req #5, Req #6, and Req #2 (artifact contract).
+
+### Req #6 — Reduce compute resources (optimization, acceleration)
+
+- Open question (open #3): does AI Studio dispatch int8 ops to CMSIS-NN? Won't matter for this 7-param model, but the answer is foundational for real models.
+- Memory pool config affects whether activations fit at all.
+- AI Studio's optimization preference ("Balanced" / "RAM" / "Time") is the user-facing axis here. Varying it is a pass-3 experiment.
+
+### Req #7 — Ease of use by Applied Scientist (no C/C++)
+
+- AI Studio GUI is a partial answer but not full picture. AS still needs to:
+  - Run a script to re-save model in stable format (`resave_model.py`).
+  - Define calibration data for pass 2.
+  - Define application-level sign-off criterion for verification.
+- These are not C/C++ but they're not zero-effort. The framework should make them turnkey: templates, scripts, docs, sane defaults.
+
+### Req #8 — Configurability (change parameters without FW revision)
+
+- **User clarification**: this means hyperparameters / app-level config loaded from a config file at boot. NOT swap of model weights.
+- Weights baked into `.rodata` is acceptable.
+- AI Studio default output is fine for #8 as defined.
+- Config-file loader is a separate component, not part of the AI Studio output. Design TBD.
+
+---
+
+## Findings from generated source (after successful TFLite load)
+
+### Files generated by AI Studio
+
+Categorized by what goes into firmware vs bookkeeping:
+
+| File | Compile into FW? | Source/Binary | Per-model or shared | Role |
+|---|---|---|---|---|
+| `network.c` | Yes | Source | Per-model | Inference graph, node sequencing |
+| `network.h` | Yes (include) | Source | Per-model | Public API, macros, model metadata |
+| `network_data.c` | Yes | Source | Per-model | Embedded weight blob (packed `uint64_t`) |
+| `network_data.h` | Yes (include) | Source | Per-model | Weight array declaration |
+| `network_weights.c` | Yes | Source | Per-model | Weight-copy helper (`network_load_weights()`); empty stub for internal-Flash deployment |
+| `network_weights.h` | Yes (include) | Source | Per-model | Header for the above |
+| `network_details.c/h` (if generated) | Yes | Source | Per-model | Layer metadata, optional debug info |
+| `stai.h`, `stai_debug.h`, `ai_*.h` | Yes (include) | Source headers | Shared | Runtime API surface |
+| `NetworkRuntime1200_xxx_GCC.a` | Yes (link) | **Binary** | Shared | Precompiled inference runtime |
+| Generation report `.txt`/`.json` | No | — | Per-model | Bookkeeping; version-control |
+| Validation `.csv` | No | — | Per-model | Bookkeeping; version-control |
+
+#### About the `.a` file
+
+- Name pattern likely encodes version + ABI: `NetworkRuntime1200` ≈ runtime v12.0.0; `GCC` = GCC ABI.
+- **ABI-locked**: a GCC `.a` won't link with Keil/ARMCC or IAR. AI Studio typically produces variants for each toolchain.
+- **Target-locked**: this `.a` was generated for `stm32l4` (Cortex-M4F, hard-float ABI). Don't reuse on M0+/M7 without regenerating.
+- Inspect with `arm-none-eabi-size NetworkRuntime1200_xxx_GCC.a` to see section sizes — that's the floor of the ML-enabled firmware overhead.
+- **Implication for Req #2**: the `.a` is part of the artifact contract. Pin its version alongside the model and AI Studio version.
+
+#### About `network_weights.c`
+
+Body is currently empty (just comments). It's a stub for the **external-storage deployment scenario**: when weights live in external Flash (e.g., the MX25R6435F QSPI Flash on the B-L4S5I-IOT01A), this function copies them into SRAM at boot.
+
+For internal-Flash deployment (what you're doing), weights live in `.rodata` and there's nothing to copy → empty body.
+
+**Always call `network_load_weights()` from your firmware boot path anyway.** It costs nothing today (empty function call) and makes the firmware portable to external-Flash deployments without code changes. This is also the natural hook for a future "swappable weights" path (Req #8, if scope ever expands).
+
+### Key facts from `network.h`
+
+- Model signature: `0xd5597816a49de03468df38b9de4d58e1` — model hash. Use as a CI artifact-version identifier.
+- `STAI_NETWORK_NODES_NUM = 2` (input + dense).
+- `STAI_NETWORK_MACC_NUM = 17`.
+- Input: float32, shape `{1, 6}`, 24 bytes.
+- Output: float32, shape `{1, 1}`, 4 bytes.
+- Activations: 28 bytes.
+- Weights: 28 bytes useful / 32 bytes in file (with alignment padding).
+
+### Weight storage — decoded (Req #8, Req #3)
+
+```c
+STAI_ALIGNED(8)
+const uint64_t g_network_weights_array[4] = {
+  0x3e514cc83e50d92aU, 0x3e46f0ba3e3fa7a5U, 0x3e5c14b63e701286U, 0xc0d4e416U,
+};
+```
+
+**Brief on the `uint64_t[4]` storage**:
+- 7 float32 weights = 28 B. Rounded up to multiple of 8 → 32 B → 4 × `uint64_t`.
+- `STAI_ALIGNED(8)` ensures 8-byte alignment; lets FPU `VLDM` load 2 floats/cycle. (Not CMSIS-NN — that's integer-only.)
+- Opaque `uint64_t` instead of `float[7]` so the same generator handles float32/float16/int8 without changing the declaration type.
+- Little-endian: `0x3e514cc83e50d92aU` stores bytes `2a d9 50 3e 8c 4c 51 3e` at increasing addresses → two float32s `0x3e50d92a` (≈0.2040) and `0x3e514cc8` (≈0.2043).
+- Last element `0xc0d4e416` is the bias (≈ −6.65); upper 4 bytes zero-padded.
+
+**Verifiability**: cannot eyeball-verify against the source model. Need a Python script that reads `model.tflite` weights and compares against the hex here. CI-able.
+
+### C API surface (Req #4, Req #7)
+
+| Function | Role |
+|---|---|
+| `stai_network_init()` | Initialize opaque context (once at boot) |
+| `network_load_weights()` | Copy weights from storage to RAM (empty stub for internal-Flash) |
+| `stai_network_set_inputs/outputs/activations/weights()` | Point runtime at buffers |
+| `stai_network_run()` | Run inference |
+| `stai_network_set_callback()` | **Hook into intermediate activations during run** |
+| `stai_network_get_error()` | Error reporting |
+
+- API is buffer-pointer-based: application owns memory, runtime is told where it is.
+- Integration ≈ 10 lines of glue (allocate, init, set pointers, run, read).
+- `STAI_NETWORK_FLAGS = (INPUTS|OUTPUTS|WEIGHTS)` declares what buffers the runtime expects.
+
+### The callback hook (`stai_network_set_callback`) is important
+
+ST documents this as: *"an API to retrieve the content on intermediate activations buffers while executing run."*
+
+Implication: **this is ST's primary mechanism for Req #3 (verifiability of intermediates) and Req #4 (replay).** Framework will register a callback that dumps every intermediate tensor.
+
+For this 2-node model the hook is degenerate. **Exercise it on a real multi-layer model in a future pass** and verify:
+- Granularity: per-node or per-tensor?
+- Performance overhead with callback enabled.
+- Buffer ownership: live runtime buffers, or copies?
+
+### Library-size considerations (Req #6)
+
+Per-model overhead:
+
+| Component | This model | Scaling |
+|---|---|---|
+| Weights | 32 B | Linear with model size |
+| Activations | 28 B | Scales with largest intermediate tensor |
+| `network.c` | ~1 KB | Grows with #layers |
+| Runtime (`.a`) | ~10–50 KB | **Fixed per build, not per model** |
+
+Implication: per-model cost is small; per-framework cost is fixed. Adding a second model on top of an existing AI-enabled firmware costs only the model-specific files.
+
+### Runtime library = part of the artifact contract (Req #2)
+
+The `.a` is compiled with certain features. If a future model uses ops not present in the linked runtime, **link will fail**. Pin the runtime version alongside the model, AI Studio version, and memory pool config.
+
+### Bug #2: "Build All" greyed out — wrong folder imported
+
+- **Symptom**: After importing the AI Studio "Generate project" output into CubeIDE, the **Build All** action is greyed out and the project doesn't appear as a C project.
+- **Root cause**: AI Studio puts the buildable project in a `CubeIDE/` subfolder. The top-level output folder contains generation reports and other artifacts, not a project. Importing the top-level folder gives you a non-C-project that can't be built.
+- **Fix**: Import the `CubeIDE/` subfolder, not the top-level. File → Import → General → Existing Projects into Workspace → point at `<output>/CubeIDE/`.
+- **Framework lesson**: document the import path explicitly in the Applied Scientist onboarding docs (Req #7). This is the kind of friction that wastes hours for new users.
+
+## Bugs and gotchas encountered
+
+### Bug #1: Keras version skew (E010 InvalidModelError)
+
+- **Symptom**: AI Studio v4.0 failed to load `model.keras` with:
+  ```
+  E010(InvalidModelError): ...
+  Unrecognized keyword arguments passed to Dense: {'quantization_config': None}
+  ```
+- **Root cause**: Model was saved by Keras 3.3+, which writes a `quantization_config` field on Dense layers. AI Studio v4.0 bundles older Keras that doesn't recognize this field. Fails at deserialization time.
+- **Workaround**: `resave_model.py` reloads the model and saves it as `.tflite` (preferred).
+- **Framework lesson**: drove the Req #2 decision to standardize on `.tflite`.
+- **Status**: workaround successful — TFLite loaded and generated code cleanly.
+
+---
+
+## Measured baseline (pass 1, float32)
+
+### Generation report numbers
+
+From `network_generate_report.txt`:
+
+| Metric | Value | Notes |
+|---|---|---|
+| Model format | float32 | Confirmed `model_fmt: float` |
+| Params | 7 (28 B) | 6 weights + 1 bias |
+| MACC | 17 | 7 for Dense, 10 for sigmoid |
+| Input | f32(1,6), 24 B | Allocated inside activations buffer |
+| Output | f32(1,1), 4 B | Allocated inside activations buffer |
+| **Flash (RO)** | **2,322 B** | Code + weights + lib |
+| **RAM (RW)** | **28 B** | Activations only; in `.bss` (static) |
+
+Flash breakdown:
+
+| Segment | Bytes | Source |
+|---|---|---|
+| `network.o` text | 754 | Per-model inference graph |
+| `NetworkRuntime1200_CM4_GCC.a` | 752 | **Lite runtime** (`use-lite-runtime` option) |
+| `libm` / `libgcc` | 712 | `expf()` for sigmoid + helpers |
+| `network.o` rodata | 48 | Layer metadata |
+| weights rodata | 32 | The 4 × `uint64_t` array (28 B + 4 B padding) |
+| toolchain rodata | 24 | Constants |
+| **Total Flash** | **2,322** | |
+
+RAM breakdown: 28 B `bss` (activations). Zero `data`. No stack growth from inference itself.
+
+**Implication**: ST's "lite runtime" is ~750 B, far smaller than the ~10-50 KB figure I quoted earlier. The mode used was `use-lite-runtime` — there's a "full" runtime variant that's bigger; worth investigating what features the full variant offers (more ops? finer-grained callbacks?) before committing the framework to lite.
+
+### Build options used (recorded for reproducibility)
+
+```
+options: allocate-inputs, allocate-outputs, multi-heaps, use-lite-runtime, use-st-ai
+optimization: balanced
+target/series: stm32l4
+c_api: st-ai
+```
+
+- `allocate-inputs`/`allocate-outputs`: I/O buffers placed inside the activations buffer. Saves RAM. **Caveat**: app must consume outputs before the next inference, since the buffer is reused.
+- `use-lite-runtime`: smaller runtime. Open question: feature trade-off vs full runtime.
+- `multi-heaps`: irrelevant for this model; relevant for larger ones spanning multiple SRAM regions.
+
+### Host validation results (`network_val_*_outputs_1.csv`)
+
+10 random samples, TFLite reference (`m_outputs`) vs generated C (`c_outputs`), both compiled for x86:
+
+| Metric | Value |
+|---|---|
+| Max absolute error | **1.4 × 10⁻⁹** |
+| Mean absolute error | 5.4 × 10⁻¹⁰ |
+| Max relative error | 5.0 × 10⁻⁷ |
+| Mean relative error | 2.3 × 10⁻⁷ |
+| Samples bit-exact | **2 of 10** |
+
+Float32 epsilon at output magnitude (~2e-3) is `~2.4 × 10⁻¹⁰`, so worst error is ~6 ULPs. Consistent with rounding-only difference in the dot product and sigmoid path. No structural divergence.
+
+Bit-exact agreement on 2 of 10 samples is a good sign — it means TFLite-on-x86 and generated-C-on-x86 take identical arithmetic paths for some inputs.
+
+**This is the baseline.** On-target error (Cortex-M4F vs x86) will add to this; expect on-target error in the range 1e-7 to 1e-5 due to FMA absence and `expf()` differences.
+
+### Tolerance decision (updates Req #3 section)
+
+- Set `test_vectors.json` float32 absolute tolerance to **`1e-5`**: well above the 1.4e-9 host-side error, with headroom for FMA + `expf` differences on M4F.
+- Sign-off criterion for the classifier is still **class agreement** (not tolerance) — to be checked on-target with the 254 test vectors.
+- Update tolerance after on-target measurement if measured error is substantially lower.
+
+## On-target verification: staged plan
+
+AI Studio's "Generate project" creates a CubeIDE project with `STM32CubeAI_Studio_AI_Init()` and `STM32CubeAI_Studio_AI_Process()` wired into `main()`. Reading `app_x-cube-ai.c` shows the full picture:
+
+- `acquire_and_process_data()` and `post_process()` are **empty stubs** (`return 0;`). Real code is inside comment blocks as a template.
+- Activation buffer is in `.bss` → zero-initialized. With `allocate-inputs` build option, **inputs are also in this buffer = all zeros**.
+- Inference runs on `[0,0,0,0,0,0]` every iteration → output is constant `sigmoid(bias) ≈ 0.0013`.
+- Output goes nowhere (empty `post_process`).
+- **UART IS initialized** (called from `STM32CubeAI_Studio_AI_Init`). The earlier note that "UART is not called" was wrong — `MX_USART1_UART_Init` is called via `MX_UARTx_Init()` inside the AI init path.
+- `LC_PRINT(...)` macros print inference timing and cycle counts over UART every 5s.
+- DWT cycle counter is wired up — real microsecond-precision inference timing available out of the box.
+
+**Staged plan** (this session = Stage 1):
+
+### Stage 1 — Build, flash, observe UART output (this session)
+
+- Open project in CubeIDE.
+- Build all. Record total binary size.
+- Flash via Debug (F11) or Run.
+- Open serial terminal at **115200 8N1** on the ST-Link VCP COM port.
+- Expect lines like:
+  ```
+  ---- Inference number N ----
+  Results for network "network"
+  Running...
+   duration DWT    : 0.XXX ms
+   CPU cycles      : XXXX
+   Sleep for 5s...
+  ```
+  every 5 seconds.
+
+**Proves**: toolchain, runtime, inference execution, UART path, DWT cycle counter — all working. You also get **real inference timing** for free.
+**Does NOT prove**: output correctness (inputs are zeros).
+
+### Stage 2 — Inspect the harness (already done)
+
+✅ Done by reading `app_x-cube-ai.c`. Key entry points identified:
+- `acquire_and_process_data()`: where to fill inputs.
+- `post_process()`: where to read outputs.
+- Both are clearly marked `USER CODE BEGIN/END` regions — safe to edit.
+- `stai_input[]` / `stai_output[]` arrays already hold the right pointers after `aiInit()`.
+
+### Stage 3 — Real verification (next session)
+
+To replace zero inputs with real test vectors, edit `acquire_and_process_data()`:
+
+```c
+int acquire_and_process_data()
+{
+  /* USER CODE BEGIN acquire_and_process_data */
+  static const float test_input[6] = {4.27f, 6.34f, ...};  // from test_vectors.json
+  memcpy(stai_input[0], test_input, sizeof(test_input));
+  return 0;
+  /* USER CODE END acquire_and_process_data */
+}
+```
+
+And edit `post_process()` to print the output:
+
+```c
+int post_process()
+{
+  /* USER CODE BEGIN post_process */
+  float prob = *(float*)stai_output[0];
+  LC_PRINT(" prob = %f\r\n", prob);  // may need printf-float flag in linker
+  return 0;
+  /* USER CODE END post_process */
+}
+```
+
+For full automation, replace the hardcoded vector with a UART-receive loop.
+
+### Other findings from `app_x-cube-ai.c` (for future framework design)
+
+| Observation | Implication |
+|---|---|
+| `STAI_ALIGNED(32)` on activation `RAM[]` | 32-byte alignment, more than strictly needed; defensive for future caches/wider loads |
+| `__attribute__((section(".AI_RAM")))` on activation buffer | **This is how you control which SRAM region holds activations.** Edit linker script to map `.AI_RAM` to SRAM1/SRAM2/SRAM3 as needed for Req #5/Req #6 |
+| `states_1[4]` allocated despite report saying states_size=0 | Dead allocation; harmless; just be aware generator can emit unused buffers |
+| `stai_network_run(..., STAI_MODE_SYNC)` | Sync mode parameter; ASYNC mode presumably exists. Investigate for Req #6 (can inference overlap with other work?) |
+| Loose error handling: `ret_code` overwritten without checking | Framework should gate each step on the previous return code. Don't rely on ST's template error path. |
+
+
+
+## Stage 1 on-target results (float32, B-L4S5I-IOT01A)
+
+### Build size (full binary, including HAL and board peripherals)
+
+| Section | Bytes | Where |
+|---|---|---|
+| `text` | 27,472 | Flash (code + rodata) |
+| `data` | 96 | Flash → RAM at boot |
+| `bss` | 10,852 | RAM only |
+| **Total Flash** | **27,568** | |
+| **Total RAM** | **10,948** | |
+
+ML overhead from the AI Studio report was 2,322 B Flash / 28 B RAM. The remaining ~25 KB Flash and ~10.9 KB RAM is HAL drivers, board peripheral init, `printf` machinery, C runtime, and stack/heap — non-ML.
+
+**Framework number to remember**: adding ML to an STM32L4S5VI firmware costs **~2.3 KB Flash + ~28 B RAM** for this model. Small models are dominated by runtime overhead, not weights; big models will invert.
+
+### On-target inference timing (UART output, inference #69 of >70 observed)
+
+```
+duration DWT    : 0.010 ms
+duration SysTick: 0 ms
+CPU cycles      : 1234
+CPU cycles (avg): 1234
+```
+
+- **CPU cycles: 1,234 per inference, zero variance across 70 runs.** Deterministic execution as expected (no input-dependent branches).
+- HCLK = 120 MHz (derived from `SystemClock_Config`: MSI 4 MHz × PLL N=60 / M=1 / R=2 = 120 MHz). FLASH_LATENCY_5 confirms.
+- **Inference time = 1,234 / 120e6 = 10.28 µs per inference**.
+- At 5 s between inferences (`HAL_Delay(5000)`), inference is ~0.0002% of CPU time. Trivial duty cycle.
+
+### Where the cycles are spent (analysis)
+
+- 7 MACs (Dense layer) ≈ 7 cycles on M4F with pipelined VFMA. **Negligible.**
+- 1 sigmoid → `expf()` from libm. **Typically 200–500 cycles on Cortex-M4F.** Dominant cost.
+- Remaining ~700–1,000 cycles: ST runtime dispatcher, kernel call overhead, buffer/error-code plumbing, callback no-op checks.
+
+**Implication for framework**: nonlinearities (sigmoid, tanh, softmax) carry hidden cost on cores without hardware transcendentals. Pass 2 (int8) should drop this — TFLite typically uses LUT-based sigmoid, eliminating the `expf` call. Expect significant cycle reduction in int8, more than the Dense layer alone would predict.
+
+For large models, per-MAC cost will dominate and activation overhead becomes proportionally small. But for shallow models with nonlinearities, the activation can be the bottleneck.
+
+### Stage 1 outcomes — all proved
+
+- ✅ Toolchain (CubeIDE + GCC) builds the AI Studio output cleanly
+- ✅ ST AI runtime links with `NetworkRuntime1200_CM4_GCC.a`
+- ✅ Inference executes on target without faulting
+- ✅ UART path functional (`LC_PRINT` via USART1 → ST-Link VCP at 115200 8N1)
+- ✅ DWT cycle counter functional; deterministic timing measurements
+- ✅ First on-target performance baseline established: **1,234 cycles / 10.28 µs / inference on L4S5VI @ 120 MHz, float32**
+
+### Stage 1 outcomes — NOT proved (Stage 3 work)
+
+- Output correctness — inputs are zeros, output is constant `sigmoid(bias)`
+- Output observability with real values — `post_process()` is empty
+- Class-agreement rate vs `test_vectors.json` reference
+
+## Open questions (answer during / after this pass)
+
+1. ~~Where do weights live in generated C?~~ ✅ `const uint64_t[]` in `.rodata`; Flash.
+2. ~~Runtime library — source or blob?~~ ✅ Precompiled `.a` (`NetworkRuntime1200_CM4_GCC.a`) in `Middlewares/.../Lib/`. Headers (source) in `Inc/`.
+3. ~~Are int8 ops dispatching to CMSIS-NN?~~ Not relevant for float32 pass; check in pass 2.
+4. ~~What's the exact C API the firmware team will call?~~ ✅ Mapped from `network.h` and `stai.h`.
+5. ~~What does AI Studio's Validate report contain?~~ ✅ Random-input m/c CSV pair; we measured 1.4e-9 max abs error.
+6. **NEW**: What does the "full" runtime variant offer vs `use-lite-runtime`? Worth a side-by-side generate to compare. Likely a pass-2 or pass-3 question.
+7. **NEW**: The report says `multi-heaps` is enabled. For a model with activations larger than one SRAM region, how does the tool partition? Relevant for Req #5, #6 on real models.
+
+## To do (this session — Stage 1)
+
+- [x] Install / open AI Studio (v4.0)
+- [x] Load `model.keras` — FAILED, see Bug #1
+- [x] Re-save model as TFLite via `resave_model.py`
+- [x] Load `model.tflite` in AI Studio — succeeded
+- [x] Generate code — succeeded
+- [x] Inspect `network_data.c` — weight array decoded
+- [x] Inspect `network.h` — API surface mapped
+- [x] Locate runtime — `.a` confirmed in `Middlewares/.../Lib/`
+- [x] Read generation report — Flash 2,322 B / RAM 28 B / MACC 17
+- [x] Run host Validate — max abs error 1.4e-9 (10 samples)
+- [x] Generate full CubeIDE project via "Generate project"
+- [x] Inspect generated `main.c` — confirms AI init+process wired into main loop
+- [x] Inspect `app_x-cube-ai.c` — confirms zero inputs, UART working, DWT timing wired
+- [x] Build full project in CubeIDE — text=27,472 / data=96 / bss=10,852 (38,420 total)
+- [x] Flash to B-L4S5I-IOT01A — succeeded via Debug (F11)
+- [x] Open serial terminal at 115200 8N1 on ST-Link VCP — output observed
+- [x] Confirm `LC_PRINT` output every 5s with cycle counts — 1,234 cycles deterministic
+- [x] **Stage 1 baseline: 10.28 µs/inference @ HCLK=120 MHz**
+
+## To do (next sessions)
+
+### Stage 3 — on-target verification with real data
+- [ ] Add input data into `acquire_and_process_data()` — start with one hardcoded vector from `test_vectors.json`
+- [ ] Add output print to `post_process()` — print the float probability
+- [ ] May need to enable printf-float in linker flags (`-u _printf_float`)
+- [ ] Compare against the expected probability in `test_vectors.json`
+- [ ] Compute class agreement across all 254 vectors (sign-off criterion)
+- [ ] Update tolerance field in `test_vectors.json` with measured value
+
+### Pass 2 — int8 quantization
+- [ ] Define calibration dataset for `tf.lite.TFLiteConverter`
+- [ ] Generate quantized `.tflite` in Python (Pattern B)
+- [ ] Compare TFLite-Python int8 outputs against float32 reference
+- [ ] Feed quantized `.tflite` to AI Studio; verify it generates int8 C
+- [ ] Compare on-target int8 outputs against TFLite-Python int8 outputs
+
+### Framework architecture
+- [ ] Exercise `stai_network_set_callback` with a real multi-layer model
+- [ ] Investigate `STAI_MODE_ASYNC` — can inference overlap with other work?
+- [ ] Replay-system integration (Req #4)
+- [ ] Config-file loader design (Req #8)
+- [ ] Power profiling (Req #5)
+- [ ] Linker script: map `.AI_RAM` to specific SRAM region for Req #5 retention / Req #6 perf
+- [ ] Compare `use-lite-runtime` vs full runtime (Req #6 trade-off study)
+- [ ] Vary AI Studio optimization preference ("Time" vs "RAM" vs "Balanced")
+
+## To do (later passes)
+
+- Int8 quantization (pass 2) — Pattern B
+- Calibration dataset definition for pass 2
+- Replay-system integration (Req #4) — exercise `stai_network_set_callback`
+- Per-layer intermediate dumps via callback hook (Req #3, beyond end-to-end)
+- Config-file loader design (Req #8)
+- Power profiling (Req #5)
+- Vary AI Studio optimization preference (Req #6)
+- Multi-layer model test — verify callback granularity, perf overhead
