@@ -65,6 +65,8 @@ default.size.stdout
 RemoteSystemsTempFiles/
 .recommenders/
 .vscode/.history/
+# Rewritten automatically by the VS Code Python Environments extension.
+.vscode/settings.json
 
 # ----- Python -----
 __pycache__/
